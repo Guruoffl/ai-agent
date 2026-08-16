@@ -1,74 +1,39 @@
 import os
 import requests
-
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-
 from memory import remember, search_memories
-
-
 load_dotenv()
-
-
-# -----------------------------
-# Calculator
-# -----------------------------
-
 def calculator(a, b, operation):
-
     if operation == "add":
         return a + b
-
     elif operation == "subtract":
         return a - b
-
     elif operation == "multiply":
         return a * b
-
     elif operation == "divide":
-
         if b == 0:
             return "Cannot divide by zero"
-
         return a / b
-
     else:
         return "Unknown operation"
-
-
-# -----------------------------
-# Current Time
-# -----------------------------
-
 def get_time():
-
     india_time = datetime.now(
         ZoneInfo("Asia/Kolkata")
     )
-
     return india_time.strftime(
         "%Y-%m-%d %I:%M:%S %p IST"
     )
-
-
-# -----------------------------
-# Web Search
-# -----------------------------
-
 def web_search(query):
-
     api_key = os.getenv(
         "SERPAPI_API_KEY"
     )
-
     if not api_key:
         return (
             "SERPAPI_API_KEY is not configured."
         )
-
     params = {
         "engine": "google",
         "q": query,
@@ -80,20 +45,14 @@ def web_search(query):
         params=params,
         timeout=15
     )
-
     response.raise_for_status()
-
     data = response.json()
-
     results = []
-
     for result in data.get(
         "organic_results",
         []
     )[:5]:
-
         results.append({
-
             "title":
                 result.get("title"),
 
