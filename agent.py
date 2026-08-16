@@ -1,109 +1,177 @@
 import os
 import json
-
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from openai import OpenAI
 from json_repair import repair_json
-
 from tool_registry import tool_registry, tools
-
-
-# ============================================================
-# LOAD ENVIRONMENT
-# ============================================================
-
 load_dotenv()
-
-
-# ============================================================
-# OPENROUTER CLIENT
-# ============================================================
-
 client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY")
+    base_url=
+        "https://openrouter.ai/api/v1",
+    api_key=
+        os.getenv(
+            "OPENROUTER_API_KEY"
+        )
 )
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 MAX_USER_TURNS = 10
 MAX_PLAN_STEPS = 5
 MAX_STEP_RETRIES = 2
 MAX_EXECUTION_CYCLES = 8
-
-
-# ============================================================
-# SYSTEM MESSAGE
-# ============================================================
-
+def get_current_date():
+    india_time = datetime.now(
+        ZoneInfo("Asia/Kolkata")
+    )
+    return india_time.strftime(
+        "%Y-%m-%d"
+    )
 SYSTEM_MESSAGE = {
-    "role": "system",
-    "content": """
+    "role":
+        "system",
+    "content":
+        """
 You are a helpful AI agent.
-
-You have access to several tools.
-
-Use calculator for arithmetic.
-
-Use get_time for the current time.
-
-Use web_search when the user needs current
-or web-based information.
-
-Use read_webpage when you need to inspect
-the contents of a webpage.
-
-Use search_memory when previous long-term
-information may be relevant.
-
-Use save_memory when the user tells you
-something durable that will be useful later.
-
-Good things to remember include:
-
-- preferences
-- learning goals
-- projects
-- skills
-- long-term plans
-
-Do not save:
-
-- passwords
-- API keys
-- secrets
-- sensitive personal information
-- temporary conversation details
-
-When calling a tool, provide valid JSON
-arguments that exactly match the tool schema.
-
-Use tool results instead of inventing facts.
+Available tools:
+calculator
+get_time
+web_search
+read_webpage
+save_memory
+search_memory
+Use tools when appropriate.
+Never invent tool results.
+Never claim real-time information is unavailable
+when an appropriate tool is available.
+Use relevant long-term memory when it helps.
 """
 }
+MEMORY_MANAGER_PROMPT = """
 
+You are a long-term memory classifier.
 
-# ============================================================
-# PLANNER PROMPT
-# ============================================================
+Determine whether the user's message contains
+durable personal information worth remembering.
+
+SAVE:
+
+"I am learning Python."
+
+"I am learning Python and its frameworks."
+
+"My goal is to become an AI engineer."
+
+"I prefer Python."
+
+"I am building an AI project."
+
+DO NOT SAVE:
+
+"What should I learn next?"
+
+"What is Python?"
+
+"How do I learn Python?"
+
+"Which framework should I learn?"
+
+"What time is it?"
+
+"Calculate 25 * 4."
+
+If a message contains both a personal fact and a question,
+save the personal fact but continue answering the question.
+
+Example:
+
+"I am learning Python. What should I learn next?"
+
+Return:
+
+{
+    "should_remember": true,
+    "memory": "User is learning Python.",
+    "is_memory_only": false
+}
+
+For:
+
+"I am learning Python."
+
+Return:
+
+{
+    "should_remember": true,
+    "memory": "User is learning Python.",
+    "is_memory_only": true
+}
+
+For:
+
+"What should I learn next?"
+
+Return:
+
+{
+    "should_remember": false,
+    "memory": "",
+    "is_memory_only": false
+}
+
+Return ONLY valid JSON.
+"""
 
 PLANNER_PROMPT = """
+
 You are the planning component of an AI agent.
 
-Analyze the user's task and break it into
-logical sequential steps.
+Create the minimum number of steps required to complete
+the user's request.
 
-Create only the steps that are actually
-necessary.
+Available tools:
 
-For simple questions, create one step.
+calculator:
+Perform arithmetic.
 
-For complex tasks, create multiple steps.
+get_time:
+Get the current time in India.
 
-Never create more than 5 initial steps.
+web_search:
+Search the internet for current information.
+
+read_webpage:
+Read a webpage.
+
+search_memory:
+Search long-term memory.
+
+IMPORTANT:
+
+The current date will be provided separately.
+
+Never use an outdated year such as 2024 unless the user
+specifically asks about 2024.
+
+Use the current year for searches about:
+- latest
+- current
+- recent
+- today
+- this year
+- current trends
+- current technologies
+
+Use relevant memory.
+
+Do not ask unnecessary clarification questions.
+
+Do not create steps that wait for the user.
+
+Do not create steps asking the user to respond.
+
+For simple questions, use one step.
+
+Maximum 5 steps.
 
 Return ONLY valid JSON.
 
@@ -114,288 +182,420 @@ Format:
         {
             "step": 1,
             "description": "..."
-        },
-        {
-            "step": 2,
-            "description": "..."
         }
     ]
 }
-
-Do not execute tools.
-Only create the plan.
 """
 
-
-# ============================================================
-# EVALUATOR PROMPT
-# ============================================================
 
 EVALUATOR_PROMPT = """
-You are the evaluation component of an AI agent.
 
-Your job is to determine whether the user's
-original request has been sufficiently completed.
+You are the evaluator of an AI agent.
 
-Look at:
+Determine whether the original task has been completed.
 
-1. The original request
-2. The completed plan steps
-3. Their results
-4. Any failed steps
+If the available result is enough to answer the user,
+return done=true.
 
-If enough reliable information exists to answer
-the user, mark the task as done.
+If another INTERNAL action is required,
+return done=false.
 
-If more work is genuinely required, mark it as
-not done and provide ONE specific next step.
+Never create a step that waits for the user.
 
-Do not repeat an already completed step unless
-there is a clear reason to retry it.
+Never create a step that asks the user to respond.
 
 Return ONLY valid JSON.
-
-If complete:
-
-{
-    "done": true,
-    "reason": "The task has been completed."
-}
-
-If more work is required:
-
-{
-    "done": false,
-    "reason": "Why more work is required.",
-    "next_step": "The next action that should be performed."
-}
 """
 
-
-# ============================================================
-# CONVERSATION MEMORY
-# ============================================================
-
-messages = [
-    SYSTEM_MESSAGE
-]
-
-
-# ============================================================
-# GET MESSAGE ROLE
-# ============================================================
-
-def get_role(message):
-
-    if isinstance(message, dict):
-        return message.get("role")
-
-    return message.role
-
-
-# ============================================================
-# TRIM SHORT-TERM MEMORY
-# ============================================================
-
-def trim_memory():
-
-    global messages
-
-    user_positions = []
-
-    for index, message in enumerate(messages):
-
-        if get_role(message) == "user":
-            user_positions.append(index)
-
-    if len(user_positions) <= MAX_USER_TURNS:
-        return
-
-    first_kept_position = user_positions[
-        -MAX_USER_TURNS
-    ]
-
-    messages = [
-        SYSTEM_MESSAGE
-    ] + messages[first_kept_position:]
-
-
-# ============================================================
-# SAFE JSON PARSER
-# ============================================================
 
 def parse_json(text):
 
     try:
 
-        return json.loads(text)
+        return json.loads(
+            text
+        )
 
     except json.JSONDecodeError:
 
-        repaired = repair_json(text)
+        repaired = repair_json(
+            text
+        )
 
-        return json.loads(repaired)
+        return json.loads(
+            repaired
+        )
 
 
-# ============================================================
-# PARSE TOOL ARGUMENTS
-# ============================================================
 
-def parse_arguments(arguments):
+def evaluate_memory(user_input):
 
     try:
 
-        return json.loads(arguments)
+        response = client.chat.completions.create(
 
-    except json.JSONDecodeError:
+            model="openrouter/free",
 
-        print(
-            "[Warning: repairing malformed JSON...]"
+            messages=[
+
+                {
+                    "role":
+                        "system",
+
+                    "content":
+                        MEMORY_MANAGER_PROMPT
+                },
+
+                {
+                    "role":
+                        "user",
+
+                    "content":
+                        user_input
+                }
+
+            ]
+
         )
 
-        repaired = repair_json(arguments)
+        content = (
+            response
+            .choices[0]
+            .message
+            .content
+        )
 
-        return json.loads(repaired)
+        if not content:
+
+            return {
+
+                "should_remember":
+                    False,
+
+                "memory":
+                    "",
+
+                "is_memory_only":
+                    False
+
+            }
+
+        decision = parse_json(
+            content
+        )
+
+        if not isinstance(
+            decision,
+            dict
+        ):
+
+            raise ValueError(
+                "Invalid memory response"
+            )
+
+        memory = str(
+            decision.get(
+                "memory",
+                ""
+            )
+        ).strip()
+
+        should_remember = bool(
+            decision.get(
+                "should_remember",
+                False
+            )
+        )
+
+        is_memory_only = bool(
+            decision.get(
+                "is_memory_only",
+                False
+            )
+        )
+
+        if not memory:
+
+            should_remember = False
+            is_memory_only = False
+
+        return {
+
+            "should_remember":
+                should_remember,
+
+            "memory":
+                memory,
+
+            "is_memory_only":
+                is_memory_only
+
+        }
+
+    except Exception as e:
+
+        print(
+            f"[Memory manager skipped: {e}]"
+        )
+
+        return {
+
+            "should_remember":
+                False,
+
+            "memory":
+                "",
+
+            "is_memory_only":
+                False
+
+        }
+
+def save_important_memory(memory):
+
+    try:
+
+        save_tool = tool_registry[
+            "save_memory"
+        ]
+
+        save_tool(
+            content=memory
+        )
+
+        print(
+            f"[Memory saved: {memory}]"
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"[Could not save memory: {e}]"
+        )
+
+        return False
 
 
-# ============================================================
-# VALIDATE PLAN
-# ============================================================
 
-def validate_plan(
-    plan,
-    user_input
+def retrieve_memories(user_input):
+
+    try:
+
+        search_tool = tool_registry[
+            "search_memory"
+        ]
+
+        results = search_tool(
+            query=user_input
+        )
+
+        if not isinstance(
+            results,
+            list
+        ):
+
+            return []
+
+        return results
+
+    except Exception as e:
+
+        print(
+            f"[Memory search skipped: {e}]"
+        )
+
+        return []
+
+
+
+def format_memory_context(memories):
+
+    if not memories:
+
+        return (
+            "No relevant long-term memory was found."
+        )
+
+    lines = []
+
+    for memory in memories:
+
+        lines.append(
+
+            f"- {memory['content']} "
+            f"(similarity: "
+            f"{memory['score']:.2f})"
+
+        )
+
+    return "\n".join(lines)
+
+
+
+def create_plan(
+    user_input,
+    memory_context
 ):
 
-    if not isinstance(plan, list):
+    current_date = get_current_date()
 
-        return [
-            {
-                "step": 1,
-                "description": user_input
-            }
-        ]
+    planner_input = f"""
 
-    valid_steps = []
+Current date:
 
-    for item in plan:
+{current_date}
 
-        if not isinstance(item, dict):
-            continue
+User request:
 
-        description = item.get("description")
+{user_input}
 
-        if not isinstance(description, str):
-            continue
+Relevant long-term memory:
 
-        description = description.strip()
+{memory_context}
 
-        if not description:
-            continue
+Use the memory when relevant.
 
-        valid_steps.append({
-
-            "step":
-                len(valid_steps) + 1,
-
-            "description":
-                description
-
-        })
-
-        if len(valid_steps) >= MAX_PLAN_STEPS:
-            break
-
-    if not valid_steps:
-
-        return [
-            {
-                "step": 1,
-                "description": user_input
-            }
-        ]
-
-    return valid_steps
-
-
-# ============================================================
-# CREATE INITIAL PLAN
-# ============================================================
-
-def create_plan(user_input):
+If the user asks about current information,
+use the current date above when constructing
+web searches.
+"""
 
     response = client.chat.completions.create(
 
         model="openrouter/free",
 
         messages=[
+
             {
-                "role": "system",
-                "content": PLANNER_PROMPT
+                "role":
+                    "system",
+
+                "content":
+                    PLANNER_PROMPT
             },
+
             {
-                "role": "user",
-                "content": user_input
+                "role":
+                    "user",
+
+                "content":
+                    planner_input
             }
+
         ]
+
     )
 
-    content = response.choices[0].message.content
+    content = (
+        response
+        .choices[0]
+        .message
+        .content
+    )
 
     try:
 
-        plan_data = parse_json(content)
+        data = parse_json(
+            content
+        )
 
-        raw_plan = plan_data.get(
+        plan = data.get(
             "plan",
             []
         )
 
-        return validate_plan(
-            raw_plan,
-            user_input
-        )
+        valid_plan = []
 
-    except Exception:
+        for item in plan:
+
+            if not isinstance(
+                item,
+                dict
+            ):
+
+                continue
+
+            description = item.get(
+                "description"
+            )
+
+            if not description:
+
+                continue
+
+            valid_plan.append({
+
+                "step":
+                    len(valid_plan) + 1,
+
+                "description":
+                    description
+
+            })
+
+        if valid_plan:
+
+            return valid_plan[
+                :MAX_PLAN_STEPS
+            ]
+
+    except Exception as e:
 
         print(
-            "[Planner failed. "
-            "Using original request as one step.]"
+            f"[Planner JSON error: {e}]"
         )
 
-        return [
-            {
-                "step": 1,
-                "description": user_input
-            }
-        ]
+    return [{
+
+        "step":
+            1,
+
+        "description":
+            user_input
+
+    }]
 
 
-# ============================================================
-# EXECUTE TOOL
-# ============================================================
+def parse_arguments(arguments):
+
+    try:
+
+        return json.loads(
+            arguments
+        )
+
+    except json.JSONDecodeError:
+
+        repaired = repair_json(
+            arguments
+        )
+
+        return json.loads(
+            repaired
+        )
+
 
 def execute_tool(tool_call):
 
-    tool_name = tool_call.function.name
+    tool_name = (
+        tool_call
+        .function
+        .name
+    )
 
-    raw_arguments = tool_call.function.arguments
+    arguments = parse_arguments(
+        tool_call
+        .function
+        .arguments
+    )
 
     print(
         f"[Using tool: {tool_name}]"
     )
 
-    # --------------------------------------------------------
-    # Parse arguments
-    # --------------------------------------------------------
-
-    try:
-
-        arguments = parse_arguments(
-            raw_arguments
-        )
-
-    except Exception as e:
+    if tool_name not in tool_registry:
 
         return {
 
@@ -406,48 +606,57 @@ def execute_tool(tool_call):
                 tool_name,
 
             "error":
-                (
-                    "Could not parse tool arguments: "
-                    f"{str(e)}"
-                )
+                "Tool not found."
 
         }
-
-    # --------------------------------------------------------
-    # Find tool
-    # --------------------------------------------------------
-
-    tool = tool_registry.get(
-        tool_name
-    )
-
-    if tool is None:
-
-        return {
-
-            "status":
-                "failed",
-
-            "tool":
-                tool_name,
-
-            "error":
-                (
-                    f"Tool '{tool_name}' "
-                    f"does not exist."
-                )
-
-        }
-
-    # --------------------------------------------------------
-    # Execute
-    # --------------------------------------------------------
 
     try:
 
-        result = tool(
+        result = tool_registry[
+            tool_name
+        ](
             **arguments
         )
+
+
+        if isinstance(
+            result,
+            str
+        ):
+
+            failure_markers = [
+
+                "not configured",
+
+                "failed",
+
+                "error",
+
+                "could not",
+
+                "cannot"
+
+            ]
+
+            lowered = result.lower()
+
+            if any(
+                marker in lowered
+                for marker in failure_markers
+            ):
+
+                return {
+
+                    "status":
+                        "failed",
+
+                    "tool":
+                        tool_name,
+
+                    "error":
+                        result
+
+                }
 
         return {
 
@@ -473,273 +682,134 @@ def execute_tool(tool_call):
                 tool_name,
 
             "error":
-                (
-                    "Tool execution error: "
-                    f"{str(e)}"
-                )
+                str(e)
 
         }
 
 
-# ============================================================
-# EXECUTE ONE STEP
-# ============================================================
 
 def execute_step(
     step_description,
-    previous_results
+    previous_results,
+    memory_context
 ):
 
-    step_messages = [
+    response = client.chat.completions.create(
 
-        SYSTEM_MESSAGE,
+        model="openrouter/free",
 
-        {
-            "role":
-                "user",
+        messages=[
 
-            "content":
-                f"""
-Execute this specific step of a larger task:
+            SYSTEM_MESSAGE,
+
+            {
+                "role":
+                    "user",
+
+                "content":
+                    f"""
+
+Execute this step:
 
 {step_description}
 
-Previous step results:
+Relevant memory:
+
+{memory_context}
+
+Previous results:
 
 {json.dumps(
     previous_results,
     indent=2
 )}
 
-Use an appropriate tool if necessary.
+Use the appropriate tool.
 
-If you successfully use a tool, do not
-unnecessarily call the same tool again.
-
-Return the result of this step.
+Do not invent results.
 """
-        }
-
-    ]
-
-    retry_count = 0
-
-    while retry_count <= MAX_STEP_RETRIES:
-
-        try:
-
-            response = client.chat.completions.create(
-
-                model="openrouter/free",
-
-                messages=step_messages,
-
-                tools=tools
-
-            )
-
-            message = response.choices[0].message
-
-            # ------------------------------------------------
-            # No tool required
-            # ------------------------------------------------
-
-            if not message.tool_calls:
-
-                return {
-
-                    "status":
-                        "success",
-
-                    "result":
-                        message.content,
-
-                    "tool":
-                        None
-
-                }
-
-            # ------------------------------------------------
-            # Execute requested tools
-            # ------------------------------------------------
-
-            tool_results = []
-
-            for tool_call in message.tool_calls:
-
-                tool_result = execute_tool(
-                    tool_call
-                )
-
-                tool_results.append(
-                    tool_result
-                )
-
-            # ------------------------------------------------
-            # Check whether any tool failed
-            # ------------------------------------------------
-
-            failed = any(
-
-                isinstance(
-                    result,
-                    dict
-                )
-
-                and
-
-                result.get(
-                    "status"
-                ) == "failed"
-
-                for result in tool_results
-
-            )
-
-            # ------------------------------------------------
-            # Recovery
-            # ------------------------------------------------
-
-            if failed:
-
-                retry_count += 1
-
-                if retry_count > MAX_STEP_RETRIES:
-
-                    return {
-
-                        "status":
-                            "failed",
-
-                        "result":
-                            tool_results,
-
-                        "tool":
-                            None
-
-                    }
-
-                print(
-
-                    f"[Retrying step "
-                    f"{retry_count}/"
-                    f"{MAX_STEP_RETRIES}]"
-
-                )
-
-                step_messages.append(
-                    message
-                )
-
-                for tool_call, result in zip(
-                    message.tool_calls,
-                    tool_results
-                ):
-
-                    step_messages.append({
-
-                        "role":
-                            "tool",
-
-                        "tool_call_id":
-                            tool_call.id,
-
-                        "content":
-                            json.dumps(
-                                result
-                            )
-
-                    })
-
-                step_messages.append({
-
-                    "role":
-                        "user",
-
-                    "content":
-                        """
-The previous tool execution failed.
-
-Try a different reasonable approach.
-
-Do not repeat the exact same failed action.
-"""
-
-                })
-
-                continue
-
-            # ------------------------------------------------
-            # Successful tool execution
-            # ------------------------------------------------
-
-            return {
-
-                "status":
-                    "success",
-
-                "result":
-                    tool_results,
-
-                "tool":
-                    (
-                        tool_results[0].get(
-                            "tool"
-                        )
-                        if tool_results
-                        and isinstance(
-                            tool_results[0],
-                            dict
-                        )
-                        else None
-                    )
-
             }
 
-        except Exception as e:
+        ],
 
-            retry_count += 1
+        tools=tools
 
-            if retry_count > MAX_STEP_RETRIES:
+    )
 
-                return {
+    message = (
+        response
+        .choices[0]
+        .message
+    )
 
-                    "status":
-                        "failed",
+    if not message.tool_calls:
 
-                    "result":
-                        str(e),
+        return {
 
-                    "tool":
-                        None
+            "status":
+                "success",
 
-                }
+            "result":
+                message.content,
 
-            print(
+            "tool":
+                None
 
-                f"[Step error. "
-                f"Retrying {retry_count}/"
-                f"{MAX_STEP_RETRIES}]"
+        }
 
-            )
+    results = []
+
+    for tool_call in message.tool_calls:
+
+        result = execute_tool(
+            tool_call
+        )
+
+        results.append(
+            result
+        )
+
+    failed = any(
+
+        result.get(
+            "status"
+        ) == "failed"
+
+        for result in results
+
+    )
+
+    if failed:
+
+        return {
+
+            "status":
+                "failed",
+
+            "result":
+                results,
+
+            "tool":
+                None
+
+        }
 
     return {
 
         "status":
-            "failed",
+            "success",
 
         "result":
-            "Step could not be completed.",
+            results,
 
         "tool":
-            None
+            results[0].get(
+                "tool"
+            )
 
     }
 
 
-# ============================================================
-# EVALUATE PROGRESS
-# ============================================================
 
 def evaluate_progress(
     user_input,
@@ -758,7 +828,6 @@ def evaluate_progress(
 
                 "content":
                     EVALUATOR_PROMPT
-
             },
 
             {
@@ -767,222 +836,8 @@ def evaluate_progress(
 
                 "content":
                     f"""
-Original user request:
 
-{user_input}
-
-Completed execution results:
-
-{json.dumps(
-    results,
-    indent=2
-)}
-
-Determine whether the task is complete.
-"""
-            }
-
-        ]
-
-    )
-
-    content = response.choices[0].message.content
-
-    try:
-
-        evaluation = parse_json(
-            content
-        )
-
-        # ----------------------------------------------
-        # Validate evaluator output
-        # ----------------------------------------------
-
-        if not isinstance(
-            evaluation,
-            dict
-        ):
-
-            return {
-
-                "done":
-                    False,
-
-                "reason":
-                    "Invalid evaluator output.",
-
-                "next_step":
-                    user_input
-
-            }
-
-        done = evaluation.get(
-            "done",
-            False
-        )
-
-        reason = evaluation.get(
-            "reason",
-            ""
-        )
-
-        next_step = evaluation.get(
-            "next_step",
-            ""
-        )
-
-        return {
-
-            "done":
-                bool(done),
-
-            "reason":
-                reason,
-
-            "next_step":
-                next_step
-
-        }
-
-    except Exception:
-
-        return {
-
-            "done":
-                False,
-
-            "reason":
-                "Could not evaluate progress.",
-
-            "next_step":
-                user_input
-
-        }
-
-
-# ============================================================
-# EXTRACT SIMPLE RESULT
-# ============================================================
-
-def extract_simple_result(
-    step_result
-):
-
-    if not isinstance(
-        step_result,
-        dict
-    ):
-
-        return None
-
-    if step_result.get(
-        "status"
-    ) != "success":
-
-        return None
-
-    result = step_result.get(
-        "result"
-    )
-
-    if not isinstance(
-        result,
-        list
-    ):
-
-        return None
-
-    if len(result) != 1:
-        return None
-
-    tool_result = result[0]
-
-    if not isinstance(
-        tool_result,
-        dict
-    ):
-
-        return None
-
-    if tool_result.get(
-        "status"
-    ) != "success":
-
-        return None
-
-    return tool_result.get(
-        "result"
-    )
-
-
-# ============================================================
-# GENERATE FINAL ANSWER
-# ============================================================
-
-def generate_final_answer(
-    user_input,
-    results
-):
-
-    # --------------------------------------------------------
-    # Direct deterministic result
-    # --------------------------------------------------------
-
-    if len(results) == 1:
-
-        simple_result = extract_simple_result(
-            results[0]
-        )
-
-        if simple_result is not None:
-
-            if results[0].get(
-                "tool"
-            ) == "calculator":
-
-                return str(
-                    simple_result
-                )
-
-    # --------------------------------------------------------
-    # LLM final answer
-    # --------------------------------------------------------
-
-    final_messages = [
-
-        {
-            "role":
-                "system",
-
-            "content":
-                """
-You are the final answer component.
-
-Answer the user's original question using
-ONLY the execution results.
-
-Do not invent facts.
-
-Do not discuss internal planning.
-
-Do not mention tool status.
-
-Do not output unrelated categories.
-
-Give the actual answer directly.
-
-If the execution results are incomplete,
-say so honestly.
-"""
-        },
-
-        {
-            "role":
-                "user",
-
-            "content":
-                f"""
-Original user request:
+Original request:
 
 {user_input}
 
@@ -992,27 +847,96 @@ Execution results:
     results,
     indent=2
 )}
-
-Provide the final answer.
 """
+            }
+
+        ]
+
+    )
+
+    try:
+
+        data = parse_json(
+            response
+            .choices[0]
+            .message
+            .content
+        )
+
+        return data
+
+    except Exception:
+
+        return {
+
+            "done":
+                True,
+
+            "reason":
+                "Returning available results.",
+
+            "next_step":
+                ""
+
         }
 
-    ]
+
+
+def generate_final_answer(
+    user_input,
+    results,
+    memory_context
+):
 
     response = client.chat.completions.create(
 
         model="openrouter/free",
 
-        messages=final_messages
+        messages=[
+
+            SYSTEM_MESSAGE,
+
+            {
+                "role":
+                    "user",
+
+                "content":
+                    f"""
+
+Answer this user request:
+
+{user_input}
+
+Relevant memory:
+
+{memory_context}
+
+Execution results:
+
+{json.dumps(
+    results,
+    indent=2
+)}
+
+If a tool failed, do not pretend that
+the tool succeeded.
+
+Give the most useful answer possible.
+"""
+            }
+
+        ]
 
     )
 
-    return response.choices[0].message.content
+    return (
+        response
+        .choices[0]
+        .message
+        .content
+    )
 
 
-# ============================================================
-# MAIN AGENT LOOP
-# ============================================================
 
 while True:
 
@@ -1028,16 +952,88 @@ while True:
 
         break
 
-    # ========================================================
-    # INITIAL PLAN
-    # ========================================================
+
+    print(
+        "\n[Checking long-term memory...]"
+    )
+
+    memory_decision = evaluate_memory(
+        user_input
+    )
+
+    if memory_decision[
+        "should_remember"
+    ]:
+
+        save_important_memory(
+            memory_decision[
+                "memory"
+            ]
+        )
+
+    if memory_decision[
+        "is_memory_only"
+    ]:
+
+        print(
+            "\n[Memory statement detected. "
+            "Skipping planner.]"
+        )
+
+        print(
+            "\nAgent: Got it. "
+            "I'll remember that."
+        )
+
+        continue
+
+    print(
+        "\n[Searching long-term memory...]"
+    )
+
+    memories = retrieve_memories(
+        user_input
+    )
+
+    memory_context = (
+        format_memory_context(
+            memories
+        )
+    )
+
+    if memories:
+
+        print(
+            "[Relevant memories found:]"
+        )
+
+        for memory in memories:
+
+            print(
+
+                f"- {memory['content']} "
+                f"(score: "
+                f"{memory['score']:.2f})"
+
+            )
+
+    else:
+
+        print(
+            "[No relevant memories found.]"
+        )
+
 
     print(
         "\n[Creating plan...]"
     )
 
     plan = create_plan(
-        user_input
+
+        user_input,
+
+        memory_context
+
     )
 
     print(
@@ -1047,13 +1043,11 @@ while True:
     for step in plan:
 
         print(
+
             f"{step['step']}. "
             f"{step['description']}"
-        )
 
-    # ========================================================
-    # AGENT EXECUTION LOOP
-    # ========================================================
+        )
 
     print(
         "\n[Executing agent...]"
@@ -1061,55 +1055,33 @@ while True:
 
     execution_results = []
 
-    current_step_number = 1
-
-    current_step_description = (
-        plan[0]["description"]
-    )
-
-    cycle = 0
-
-    while cycle < MAX_EXECUTION_CYCLES:
-
-        cycle += 1
+    for step in plan:
 
         print(
-            f"\n[Cycle {cycle}/"
-            f"{MAX_EXECUTION_CYCLES}]"
+            f"\n[Step {step['step']}] "
+            f"{step['description']}"
         )
-
-        print(
-            f"[Step {current_step_number}] "
-            f"{current_step_description}"
-        )
-
-        # ----------------------------------------------------
-        # Execute
-        # ----------------------------------------------------
 
         result = execute_step(
 
-            step_description=
-                current_step_description,
+            step["description"],
 
-            previous_results=
-                execution_results
+            execution_results,
+
+            memory_context
 
         )
 
-        step_record = {
+        execution_results.append({
 
             "step":
-                current_step_number,
+                step["step"],
 
             "description":
-                current_step_description,
+                step["description"],
 
             "status":
-                result.get(
-                    "status",
-                    "unknown"
-                ),
+                result["status"],
 
             "tool":
                 result.get(
@@ -1119,113 +1091,52 @@ while True:
             "result":
                 result.get(
                     "result",
-                    result
+                    result.get(
+                        "error"
+                    )
                 )
 
-        }
-
-        execution_results.append(
-            step_record
-        )
+        })
 
         print(
+
             f"[Step status: "
-            f"{step_record['status']}]"
-        )
-
-        # ----------------------------------------------------
-        # Evaluate
-        # ----------------------------------------------------
-
-        print(
-            "[Evaluating progress...]"
-        )
-
-        evaluation = evaluate_progress(
-
-            user_input=
-                user_input,
-
-            results=
-                execution_results
+            f"{result['status']}]"
 
         )
 
-        print(
-            f"[Done: "
-            f"{evaluation.get('done')}]"
-        )
-
-        print(
-            f"[Reason: "
-            f"{evaluation.get('reason', '')}]"
-        )
-
-        # ----------------------------------------------------
-        # Task completed
-        # ----------------------------------------------------
-
-        if evaluation.get(
-            "done"
-        ):
+        if result["status"] == "failed":
 
             print(
-                "\n[Agent decided the task "
-                "is complete.]"
+
+                f"[Tool failed: "
+                f"{result.get('error', result.get('result'))}]"
+
             )
 
-            break
 
-        # ----------------------------------------------------
-        # Get next step
-        # ----------------------------------------------------
+    print(
+        "\n[Evaluating progress...]"
+    )
 
-        next_step = evaluation.get(
-            "next_step"
-        )
+    evaluation = evaluate_progress(
 
-        if not isinstance(
-            next_step,
-            str
-        ):
+        user_input,
 
-            next_step = ""
+        execution_results
 
-        next_step = next_step.strip()
+    )
 
-        if not next_step:
+    print(
+        f"[Done: "
+        f"{evaluation.get('done', True)}]"
+    )
 
-            print(
-                "[Evaluator did not provide "
-                "a next step.]"
-            )
+    print(
+        f"[Reason: "
+        f"{evaluation.get('reason', '')}]"
+    )
 
-            break
-
-        current_step_number += 1
-
-        current_step_description = (
-            next_step
-        )
-
-        print(
-            f"[Next step: "
-            f"{current_step_description}]"
-        )
-
-    # ========================================================
-    # MAX CYCLES REACHED
-    # ========================================================
-
-    if cycle >= MAX_EXECUTION_CYCLES:
-
-        print(
-            "\n[Maximum execution cycles reached.]"
-        )
-
-    # ========================================================
-    # FINAL ANSWER
-    # ========================================================
 
     print(
         "\n[Generating final answer...]"
@@ -1233,11 +1144,11 @@ while True:
 
     answer = generate_final_answer(
 
-        user_input=
-            user_input,
+        user_input,
 
-        results=
-            execution_results
+        execution_results,
+
+        memory_context
 
     )
 
@@ -1245,29 +1156,3 @@ while True:
         "\nAgent:",
         answer
     )
-
-    # ========================================================
-    # SAVE CONVERSATION
-    # ========================================================
-
-    messages.append({
-
-        "role":
-            "user",
-
-        "content":
-            user_input
-
-    })
-
-    messages.append({
-
-        "role":
-            "assistant",
-
-        "content":
-            answer
-
-    })
-
-    trim_memory()

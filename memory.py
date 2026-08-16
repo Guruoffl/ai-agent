@@ -7,15 +7,13 @@ from sentence_transformers import SentenceTransformer
 
 
 MEMORY_FILE = "memory.json"
-
 MODEL_NAME = "all-MiniLM-L6-v2"
+
+SIMILARITY_THRESHOLD = 0.25
 
 model = SentenceTransformer(MODEL_NAME)
 
 
-# -----------------------------
-# Load memories
-# -----------------------------
 
 def load_memories():
 
@@ -30,16 +28,20 @@ def load_memories():
             encoding="utf-8"
         ) as file:
 
-            return json.load(file)
+            data = json.load(file)
 
-    except (json.JSONDecodeError, OSError):
+        if not isinstance(data, list):
+            return []
+
+        return data
+
+    except (
+        json.JSONDecodeError,
+        OSError
+    ):
 
         return []
 
-
-# -----------------------------
-# Save memories
-# -----------------------------
 
 def save_memories(memories):
 
@@ -57,9 +59,6 @@ def save_memories(memories):
         )
 
 
-# -----------------------------
-# Create embedding
-# -----------------------------
 
 def create_embedding(text):
 
@@ -71,22 +70,48 @@ def create_embedding(text):
     return embedding.tolist()
 
 
-# -----------------------------
-# Remember
-# -----------------------------
 
 def remember(content):
 
+    content = str(content).strip()
+
+    if not content:
+        return "Memory content is empty."
+
     memories = load_memories()
+
+    for memory in memories:
+
+        if not isinstance(memory, dict):
+            continue
+
+        if memory.get("content") == content:
+
+            if not memory.get("embedding"):
+
+                memory["embedding"] = create_embedding(
+                    content
+                )
+
+                save_memories(memories)
+
+            return "Memory already exists."
 
     embedding = create_embedding(
         content
     )
 
     memory = {
-        "content": content,
-        "embedding": embedding,
-        "created_at": datetime.now().isoformat()
+
+        "content":
+            content,
+
+        "embedding":
+            embedding,
+
+        "created_at":
+            datetime.now().isoformat()
+
     }
 
     memories.append(memory)
@@ -96,9 +121,6 @@ def remember(content):
     return "Memory saved successfully."
 
 
-# -----------------------------
-# Semantic Memory Search
-# -----------------------------
 
 def search_memories(
     query,
@@ -108,44 +130,107 @@ def search_memories(
     memories = load_memories()
 
     if not memories:
-
         return "No memories stored yet."
-
 
     query_embedding = np.array(
         create_embedding(query)
     )
 
-
     scored_memories = []
 
+    memory_file_changed = False
 
     for memory in memories:
 
-        memory_embedding = np.array(
-            memory["embedding"]
-        )
+        if not isinstance(memory, dict):
+            continue
+
+        content = memory.get("content")
+
+        if not content:
+            continue
+
+        embedding = memory.get("embedding")
+
+        if not embedding:
+
+            print(
+                f"[Repairing memory embedding: {content}]"
+            )
+
+            embedding = create_embedding(
+                content
+            )
+
+            memory["embedding"] = embedding
+
+            memory_file_changed = True
 
 
-        # Cosine similarity
+        try:
+
+            memory_embedding = np.array(
+                embedding
+            )
+
+        except Exception:
+
+            continue
+
+        
+
+        if (
+            memory_embedding.ndim != 1
+            or
+            memory_embedding.shape !=
+            query_embedding.shape
+        ):
+
+            print(
+                f"[Rebuilding invalid embedding: {content}]"
+            )
+
+            memory_embedding = np.array(
+                create_embedding(content)
+            )
+
+            memory["embedding"] = (
+                memory_embedding.tolist()
+            )
+
+            memory_file_changed = True
+
         score = np.dot(
             query_embedding,
             memory_embedding
         )
 
-
         scored_memories.append({
 
             "content":
-                memory["content"],
+                content,
 
             "score":
                 float(score),
 
             "created_at":
-                memory["created_at"]
+                memory.get(
+                    "created_at",
+                    ""
+                )
 
         })
+
+
+    if memory_file_changed:
+
+        save_memories(
+            memories
+        )
+
+        print(
+            "[Memory database repaired.]"
+        )
 
 
     scored_memories.sort(
@@ -154,17 +239,20 @@ def search_memories(
     )
 
 
-    # Only return reasonably relevant memories
     relevant = [
-        memory
-        for memory in scored_memories[:top_k]
-        if memory["score"] >= 0.35
-    ]
 
+        memory
+
+        for memory
+        in scored_memories[:top_k]
+
+        if memory["score"] >=
+        SIMILARITY_THRESHOLD
+
+    ]
 
     if not relevant:
 
         return "No relevant memories found."
-
 
     return relevant

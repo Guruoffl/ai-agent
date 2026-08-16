@@ -1,15 +1,9 @@
 venv/
-
 .env
-
 __pycache__/
 *.pyc
 *.pyo
-
 memory.json
-
 .DS_Store
-
-
 .vscode/
 .idea/
